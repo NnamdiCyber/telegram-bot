@@ -168,54 +168,50 @@ NOTIFY_CATEGORIES=__none__
 
 ---
 
-## 4. Decimal USDC Threshold Normalization
+## 4. Per-Route Notification Filter Overrides
 
-Both [`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts) and [`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts) normalize equivalent decimal USDC thresholds to 7-decimal atomic units (`bigint`) before comparison:
+For multi-route deployments that combine typed filter expressions ([`src/notifications/filter-expr.ts`](../src/notifications/filter-expr.ts)) and USDC amount thresholds ([`src/notifications/amount-threshold.ts`](../src/notifications/amount-threshold.ts)), [`src/notifications/route-filters.ts`](../src/notifications/route-filters.ts) provides per-route filter overrides via `compileRouteFilters(config, options?)`.
 
-- **Canonical equivalence**: Equivalent decimal strings (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) normalize identically via `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (both explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`).
-- **Precision limit**: Values exceeding seven fractional digits (for example `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
+Equivalent decimal USDC thresholds (for example `"1"`, `"01"`, `"1.0"`, `"1.00"`, and `"1.0000000"`) are normalized identically to 7-decimal atomic units before comparison in `parseUsdcThreshold` / `normalizeUsdcThreshold` and in filter expression comparisons (including explicit `USDC` / `$` literals and bare decimal literals such as `stake >= 10.50`). Values exceeding seven fractional digits (such as `"1.00000000"` or `"0.00000001"`) are rejected with `InvalidThresholdError` or `FilterParseError`.
 
----
+### 4.1 Precedence Rules
 
-## 5. Filter Explanation Tree (Operator Diagnostics)
+When `registry.evaluate(routeId, event)` runs for a route:
 
-[`explainFilterRule(rule, event, options?)`](../src/notifications/filter-expr.ts) explains *why* a parsed filter expression (and, optionally, the amount thresholds) allowed or denied one event. It is a dry-run diagnostic only: the live path still uses `evaluateFilterRule` and `meetsThreshold`, whose exports and semantics are unchanged.
+1. **Invalid override isolation**: If the route's override failed validation at compile time, it is isolated in `registry.invalidRoutes` and never affects other routes or the global policy.
+   - Under the default `invalidRouteFallback: "global"`, the affected route falls back to the compiled global policy (`overrideStatus: "invalid_fallback_global"`).
+   - Under `invalidRouteFallback: "deny"`, the affected route fails closed (`allowed: false`, `reason: "invalid_override_denied"`).
+2. **Route kill switch (`enabled: false`)**: Suppresses all events for that route regardless of global rules (`reason: "route_disabled"`).
+3. **Effective thresholds**:
+   - `mode: "merge"` *(default)*: Route threshold fields (`marketChallenge`, `squadDeposit`) override the corresponding global threshold fields when explicitly set (including `"0"` / `0n` to disable a global threshold for that route). Unspecified fields inherit from the global policy.
+   - `mode: "replace"`: Route thresholds completely replace global thresholds for that route.
+4. **Effective filter expressions**:
+   - `mode: "merge"` *(default)*: Global expressions (if non-empty) **and** route expressions (if non-empty) must both match. Within a single expression list, matching any rule satisfies that list (OR semantics).
+   - `mode: "replace"`: Route expressions completely replace global expressions for that route.
 
-The tree mirrors the rule and its expression AST:
+### 4.2 Example Configuration
 
-| Node `kind` | When present | Meaning |
-| :--- | :--- | :--- |
-| `rule` | Always (root) | Final decision. `matched` and the top-level `reason` always equal `evaluateFilterRule` / `evaluateFilterDryRun`. |
-| `event-name` | The rule names an event | Whether the event is the named one. |
-| `and` / `or` | Logical operators in the condition | Children are the left and right operands, in source order. |
-| `comparison` | Each predicate in the condition | `matched`, `predicate-false`, or `missing-field`. |
-| `threshold` | `options.thresholds` is given | Amount threshold check, evaluated after the expression as in the live path. |
+```ts
+import { compileRouteFilters } from "./notifications/route-filters.js";
 
-Each node carries `matched`, an `outcome` (`matched`, `event-name-mismatch`, `missing-field`, `predicate-false`, `below-threshold`, `not-configured`, `not-evaluated`) and a short `reason`. Branches the live evaluator short-circuits (the right side of a failed `and` or a matched `or`, the condition after an event-name mismatch, the threshold after a failed expression) are reported as `not-evaluated`, so the tree shows exactly what the live path looked at. Output is deterministic and JSON-serializable (no `bigint` values).
-
-`renderFilterExplanation(explanation)` renders the tree as indented plain text, one line per node. For the rule `claim_challenged where (stake >= 100 USDC and challenger != "G…") or claimId == 42` with a 10 USDC challenge threshold, against a synthetic 25 USDC challenge on claim 7:
-
-```text
-✗ [rule] rule failed (predicate-false): event denied
-  ✓ [event-name] event is claim_challenged
-  ✗ [or] or: neither side matched
-    ✗ [and] and: left side failed; right side not evaluated
-      ✗ [comparison] stake >= 100 USDC: false
-      - [comparison] challenger != <redacted>: not evaluated
-    ✗ [comparison] claimId == 42: false
-  - [threshold] amount threshold: not evaluated
+const registry = compileRouteFilters({
+  global: {
+    thresholds: { marketChallenge: "20", squadDeposit: "50" },
+    expressions: ["claim_challenged", "deposited", "claim_created where category == 'crypto'"],
+  },
+  routes: {
+    "whale-chat": {
+      // mode: "merge" (default) — raises marketChallenge to 100 USDC, inherits squadDeposit = 50 USDC
+      thresholds: { marketChallenge: "100" },
+    },
+    "firehose": {
+      // mode: "replace" — ignores global thresholds and expressions for this route
+      mode: "replace",
+    },
+    "muted-chat": {
+      enabled: false,
+    },
+  },
+});
 ```
 
-### 5.1 Privacy
-
-Reasons never contain payload values: no addresses, claim titles, summaries, questions, categories, or amounts from the event. String literals written in the rule (which may hold an address, a chat or route identity, or message text) are shown as `<redacted>`. Only schema field names, operators, numeric literals, USDC amounts written in the rule, configured threshold minimums, and the rule's own (schema-validated) event name appear. On an event-name mismatch the event's actual name is not echoed.
-
-### 5.2 Bounds
-
-| Option | Default | Minimum | Effect |
-| :--- | :--- | :--- | :--- |
-| `maxNodes` | `MAX_EXPLANATION_NODES` (64) | 1 | Nodes kept, in pre-order. |
-| `maxDepth` | `MAX_EXPLANATION_DEPTH` (32) | 0 | Levels kept below the root. |
-| `maxReasonLength` | `MAX_EXPLANATION_REASON_LENGTH` (96) | 8 | Characters per `reason`; longer reasons end in `…`. |
-
-Dropped subtrees are counted in the parent's `omitted` field and `truncated` is set to `true`; truncation never changes `matched` or `reason`. Invalid values (`NaN`, `Infinity`) fall back to the default and values below the minimum are raised to it. The defaults fit the largest expression the parser accepts (`MAX_FILTER_TOKENS`, a left-deep chain of 24 comparisons) without truncation.
